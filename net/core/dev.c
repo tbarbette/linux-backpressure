@@ -3943,7 +3943,10 @@ ncls:
 		}
 		switch (rx_handler(&skb)) {
 		case RX_HANDLER_CONSUMED:
-			ret = NET_RX_SUCCESS;
+            ret = NET_RX_SUCCESS;
+            goto out;
+		case RX_HANDLER_DROPPED:
+			ret = NET_RX_DROP;
 			goto out;
 		case RX_HANDLER_ANOTHER:
 			goto another_round;
@@ -4767,14 +4770,15 @@ static enum hrtimer_restart napi_watchdog(struct hrtimer *timer)
 	struct napi_struct *napi;
 
 	napi = container_of(timer, struct napi_struct, timer);
-	if (napi->gro_list)
+    if (napi->gro_list)
 		napi_schedule(napi);
 
 	return HRTIMER_NORESTART;
 }
 
 void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
-		    int (*poll)(struct napi_struct *, int), int weight)
+		    int (*poll)(struct napi_struct *, int),
+            int weight)
 {
 	INIT_LIST_HEAD(&napi->poll_list);
 	hrtimer_init(&napi->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
@@ -4793,6 +4797,7 @@ void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
 	spin_lock_init(&napi->poll_lock);
 	napi->poll_owner = -1;
 #endif
+    napi->backoff = 0;
 	set_bit(NAPI_STATE_SCHED, &napi->state);
 }
 EXPORT_SYMBOL(netif_napi_add);

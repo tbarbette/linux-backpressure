@@ -321,6 +321,7 @@ struct napi_struct {
 	struct list_head	dev_list;
 	struct hlist_node	napi_hash_node;
 	unsigned int		napi_id;
+	int backoff;
 };
 
 enum {
@@ -385,6 +386,7 @@ enum rx_handler_result {
 	RX_HANDLER_ANOTHER,
 	RX_HANDLER_EXACT,
 	RX_HANDLER_PASS,
+	RX_HANDLER_DROPPED,
 };
 typedef enum rx_handler_result rx_handler_result_t;
 typedef rx_handler_result_t rx_handler_func_t(struct sk_buff **pskb);
@@ -423,6 +425,16 @@ static inline void napi_schedule(struct napi_struct *n)
 {
 	if (napi_schedule_prep(n))
 		__napi_schedule(n);
+}
+
+static inline int napi_backoff(struct napi_struct *n)
+{
+   return n->backoff;
+}
+
+static inline void napi_set_backoff(struct napi_struct *n)
+{
+   n->backoff = 1;
 }
 
 /**
@@ -1236,6 +1248,8 @@ struct net_device_ops {
 							 bool proto_down);
 	int			(*ndo_fill_metadata_dst)(struct net_device *dev,
 						       struct sk_buff *skb);
+	void		(*ndo_reenable_itr)(struct net_device *dev, int q);
+
 };
 
 /**

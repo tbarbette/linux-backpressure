@@ -325,6 +325,9 @@ int i40e_setup_tx_descriptors(struct i40e_ring *tx_ring);
 int i40e_setup_rx_descriptors(struct i40e_ring *rx_ring);
 void i40e_free_tx_resources(struct i40e_ring *tx_ring);
 void i40e_free_rx_resources(struct i40e_ring *rx_ring);
+
+void i40e_reenable_itr(struct net_device *netdev, int q);
+void i40e_napi_reenable_itr(struct napi_struct *napi);
 int i40e_napi_poll(struct napi_struct *napi, int budget);
 #ifdef I40E_FCOE
 void i40e_tx_map(struct i40e_ring *tx_ring, struct sk_buff *skb,

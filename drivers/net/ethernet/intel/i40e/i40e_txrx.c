@@ -25,6 +25,7 @@
  ******************************************************************************/
 
 #include <linux/prefetch.h>
+#include <linux/netpoll.h>
 #include <net/busy_poll.h>
 #include "i40e.h"
 #include "i40e_prototype.h"
@@ -1303,7 +1304,7 @@ no_buffers:
  * @skb: packet to send up
  * @vlan_tag: vlan tag for packet
  **/
-static void i40e_receive_skb(struct i40e_ring *rx_ring,
+static int i40e_receive_skb(struct i40e_ring *rx_ring,
 			     struct sk_buff *skb, u16 vlan_tag)
 {
 	struct i40e_q_vector *q_vector = rx_ring->q_vector;
@@ -1311,7 +1312,7 @@ static void i40e_receive_skb(struct i40e_ring *rx_ring,
 	if (vlan_tag & VLAN_VID_MASK)
 		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vlan_tag);
 
-	napi_gro_receive(&q_vector->napi, skb);
+	return napi_gro_receive(&q_vector->napi, skb);
 }
 
 /**
@@ -1490,6 +1491,7 @@ static int i40e_clean_rx_irq_ps(struct i40e_ring *rx_ring, int budget)
 	u32 rx_error, rx_status;
 	u8 rx_ptype;
 	u64 qword;
+	int stop = 0;
 
 	if (budget <= 0)
 		return 0;
@@ -1647,11 +1649,13 @@ static int i40e_clean_rx_irq_ps(struct i40e_ring *rx_ring, int budget)
 		}
 #endif
 		skb_mark_napi_id(skb, &rx_ring->q_vector->napi);
-		i40e_receive_skb(rx_ring, skb, vlan_tag);
+		stop = i40e_receive_skb(rx_ring, skb, vlan_tag) == GRO_DROP;
+		if (unlikely(stop)) {
+			rx_ring->q_vector->napi.backoff = 1;
+		}
 
 		rx_desc->wb.qword1.status_error_len = 0;
-
-	} while (likely(total_rx_packets < budget));
+	} while (likely(total_rx_packets < budget && !stop));
 
 	u64_stats_update_begin(&rx_ring->syncp);
 	rx_ring->stats.packets += total_rx_packets;
@@ -1681,6 +1685,7 @@ static int i40e_clean_rx_irq_1buf(struct i40e_ring *rx_ring, int budget)
 	u8 rx_ptype;
 	u64 qword;
 	u16 i;
+	int stop = 0;
 
 	do {
 		struct i40e_rx_buffer *rx_bi;
@@ -1775,10 +1780,13 @@ static int i40e_clean_rx_irq_1buf(struct i40e_ring *rx_ring, int budget)
 			continue;
 		}
 #endif
-		i40e_receive_skb(rx_ring, skb, vlan_tag);
+		stop = i40e_receive_skb(rx_ring, skb, vlan_tag) == GRO_DROP;
+		if (unlikely(stop)) {
+			rx_ring->q_vector->napi.backoff = 1;
+		}
 
 		rx_desc->wb.qword1.status_error_len = 0;
-	} while (likely(total_rx_packets < budget));
+	} while (likely(total_rx_packets < budget && !stop));
 
 	u64_stats_update_begin(&rx_ring->syncp);
 	rx_ring->stats.packets += total_rx_packets;
@@ -1880,6 +1888,43 @@ enable_int:
 
 }
 
+void i40e_reenable_itr(struct net_device* netdev, int q) {
+    struct i40e_netdev_priv *np = netdev_priv(netdev);
+	struct i40e_ring *rx_ring = np->vsi->rx_rings[q];
+    struct napi_struct* napi = &rx_ring->q_vector->napi;
+    void* have;
+
+//    printk("Reenabling intr from user for napi %p\n",napi);
+//    have = netpoll_poll_lock(napi); //Lock should be done in a generic netdev_reenable_intr
+    i40e_napi_reenable_itr(napi);
+//    netpoll_poll_unlock(have);
+}
+
+void i40e_napi_reenable_itr(struct napi_struct *napi) {
+	struct i40e_q_vector *q_vector =
+			       container_of(napi, struct i40e_q_vector, napi);
+	struct i40e_vsi *vsi = q_vector->vsi;
+    if (vsi->back->flags & I40E_FLAG_MSIX_ENABLED) {
+        i40e_update_enable_itr(vsi, q_vector);
+    } else { /* Legacy mode */
+        struct i40e_hw *hw = &vsi->back->hw;
+        /* We re-enable the queue 0 cause, but
+         * don't worry about dynamic_enable
+         * because we left it on for the other
+         * possible interrupts during napi
+         */
+        u32 qval = rd32(hw, I40E_QINT_RQCTL(0)) |
+               I40E_QINT_RQCTL_CAUSE_ENA_MASK;
+
+        wr32(hw, I40E_QINT_RQCTL(0), qval);
+        qval = rd32(hw, I40E_QINT_TQCTL(0)) |
+               I40E_QINT_TQCTL_CAUSE_ENA_MASK;
+        wr32(hw, I40E_QINT_TQCTL(0), qval);
+        i40e_irq_dynamic_enable_icr0(vsi->back);
+    }
+    napi->backoff = 0;
+}
+
 /**
  * i40e_napi_poll - NAPI polling Rx/Tx cleanup routine
  * @napi: napi struct with our devices info in it
@@ -1949,23 +1994,8 @@ tx_only:
 
 	/* Work is done so exit the polling mode and re-enable the interrupt */
 	napi_complete_done(napi, work_done);
-	if (vsi->back->flags & I40E_FLAG_MSIX_ENABLED) {
-		i40e_update_enable_itr(vsi, q_vector);
-	} else { /* Legacy mode */
-		struct i40e_hw *hw = &vsi->back->hw;
-		/* We re-enable the queue 0 cause, but
-		 * don't worry about dynamic_enable
-		 * because we left it on for the other
-		 * possible interrupts during napi
-		 */
-		u32 qval = rd32(hw, I40E_QINT_RQCTL(0)) |
-			   I40E_QINT_RQCTL_CAUSE_ENA_MASK;
-
-		wr32(hw, I40E_QINT_RQCTL(0), qval);
-		qval = rd32(hw, I40E_QINT_TQCTL(0)) |
-		       I40E_QINT_TQCTL_CAUSE_ENA_MASK;
-		wr32(hw, I40E_QINT_TQCTL(0), qval);
-		i40e_irq_dynamic_enable_icr0(vsi->back);
+	if (!napi_backoff(napi)) {
+		i40e_napi_reenable_itr(napi);
 	}
 	return 0;
 }
